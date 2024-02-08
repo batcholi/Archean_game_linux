@@ -199,7 +199,7 @@ void main() {
 	else mieScattering = vec3(0);
 	vec4 fog = vec4(rayleighScattering + mieScattering + emission, pow(clamp(maxDepth/thickness, 0, 1), 2));
 	
-	ray.color.rgb += fog.rgb * renderer.globalLightingFactor;
+	ray.plasma.rgb += fog.rgb * renderer.globalLightingFactor;
 	ray.color.a += pow(fog.a, 32);
 	
 	// Debug Time

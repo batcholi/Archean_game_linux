@@ -72,4 +72,9 @@ void main() {
 	if (surface.metallic == 0.0 && surface.roughness == 0.0) {
 		ray.color.a = 2.0;
 	}
+	
+	// Debug Time
+	if (xenonRendererData.config.debugViewMode == RENDERER_DEBUG_VIEWMODE_RAYHIT_TIME) {
+		if (RAY_RECURSIONS == 0) WRITE_DEBUG_TIME
+	}
 }

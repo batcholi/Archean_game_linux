@@ -47,7 +47,6 @@ float t2 = t2_;
 // }
 
 void main() {
-	uint recursions = RAY_RECURSIONS;
 	vec3 exaustColor = PlasmaData(AABB.data).color;
 	float exaustDensity = PlasmaData(AABB.data).density;
 	float exaustTemperature = PlasmaData(AABB.data).temperature;
@@ -66,10 +65,6 @@ void main() {
 		ray.normal = vec3(0);
 		ray.plasma.rgb = GetEmissionColor(exaustTemperature) * 0.5;
 		ray.plasma.a = 0;
-		return;
-	}
-
-	if (recursions >= RAY_MAX_RECURSION) {
 		return;
 	}
 	
@@ -91,6 +86,6 @@ void main() {
 	
 	// Debug Time
 	if (xenonRendererData.config.debugViewMode == RENDERER_DEBUG_VIEWMODE_RAYHIT_TIME) {
-		if (recursions == 0) WRITE_DEBUG_TIME
+		if (RAY_RECURSIONS == 0) WRITE_DEBUG_TIME
 	}
 }

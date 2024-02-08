@@ -78,8 +78,8 @@ float caustics(vec3 worldPosition, vec3 normal, float t) {
 	return pow(l,7.)*25.;
 }
 
-vec3 GetDirectLighting(in vec3 worldPosition, in vec3 normal, in vec3 albedo, in float fresnel) {
-	vec3 position = worldPosition + normal * gl_HitTEXT * 0.001;
+vec3 GetDirectLighting(in vec3 worldPosition, in vec3 rayDirection, in vec3 normal, in vec3 albedo, in float referenceDistance, in float metallic, in float roughness, in float specular) {
+	vec3 position = worldPosition + normal * referenceDistance * 0.001;
 	vec3 directLighting = vec3(0);
 	
 	rayQueryEXT q;
@@ -100,7 +100,7 @@ vec3 GetDirectLighting(in vec3 worldPosition, in vec3 normal, in vec3 albedo, in
 		vec3 lightDir = normalize(relativeLightPosition);
 		float nDotL = dot(normal, lightDir);
 		LightSourceInstanceData lightSource = renderer.lightSources[lightID].instance;
-		float distanceToLightSurface = length(relativeLightPosition) - lightSource.innerRadius - gl_HitTEXT * EPSILON;
+		float distanceToLightSurface = length(relativeLightPosition) - lightSource.innerRadius - referenceDistance * EPSILON;
 		if (distanceToLightSurface <= 0.001) {
 			directLighting += lightSource.color * lightSource.power;
 			ray.ssao = 0;
@@ -190,10 +190,10 @@ vec3 GetDirectLighting(in vec3 worldPosition, in vec3 normal, in vec3 albedo, in
 				if (ray.hitDistance == -1) {
 					// lit
 					vec3 light = lightsColor[i] * lightsPower[i];
-					vec3 diffuse = albedo * light * clamp(dot(normal, shadowRayDir), 0, 1) * (1 - surface.metallic) * mix(0.5, 1, surface.roughness);
+					vec3 diffuse = albedo * light * clamp(dot(normal, shadowRayDir), 0, 1) * (1 - metallic) * mix(0.5, 1, roughness);
 					vec3 reflectDir = reflect(-shadowRayDir, normal);
-					vec3 specular = light * pow(max(dot(-gl_WorldRayDirectionEXT, reflectDir), 0.0), mix(16, 4, surface.metallic)) * mix(vec3(1), albedo, surface.metallic);
-					directLighting += colorFilter * (1 - clamp(opacity,0,1)) * mix(diffuse, (diffuse + specular) * 0.5, step(1, float(renderer.options & RENDERER_OPTION_SPECULAR_SURFACES)) * surface.specular);
+					vec3 spec = light * pow(max(dot(-rayDirection, reflectDir), 0.0), mix(16, 4, metallic)) * mix(vec3(1), albedo, metallic);
+					directLighting += colorFilter * (1 - clamp(opacity,0,1)) * mix(diffuse, (diffuse + spec) * 0.5, step(1, float(renderer.options & RENDERER_OPTION_SPECULAR_SURFACES)) * specular);
 					
 					// if (++usefulLights == 2) {
 					// 	ray = originalRay;
@@ -251,6 +251,7 @@ vec3 GetDirectLighting(in vec3 worldPosition, in vec3 normal, in vec3 albedo, in
 	}
 #endif
 
+#ifdef SHADER_RCHIT
 void ApplyDefaultLighting() {
 	bool rayIsShadow = RAY_IS_SHADOW;
 	uint recursions = RAY_RECURSIONS;
@@ -262,9 +263,6 @@ void ApplyDefaultLighting() {
 		return;
 	}
 	
-	// Fresnel
-	float fresnel = Fresnel((renderer.viewMatrix * vec4(ray.worldPosition, 1)).xyz, normalize(WORLD2VIEWNORMAL * ray.normal), surface.ior);
-	
 	vec3 albedo = surface.color.rgb;
 	
 	float realDistance = length(ray.worldPosition - inverse(renderer.viewMatrix)[3].xyz);
@@ -273,7 +271,7 @@ void ApplyDefaultLighting() {
 	vec3 directLighting = vec3(0);
 	if ((renderer.options & RENDERER_OPTION_DIRECT_LIGHTING) != 0) {
 		if (recursions < RAY_MAX_RECURSION && surface.metallic - surface.roughness < 1.0) {
-			directLighting = GetDirectLighting(ray.worldPosition, ray.normal, albedo, fresnel);
+			directLighting = GetDirectLighting(ray.worldPosition, gl_WorldRayDirectionEXT, ray.normal, albedo, gl_HitTEXT, surface.metallic, surface.roughness, surface.specular);
 		}
 	}
 	ray.color = vec4(mix(directLighting * renderer.globalLightingFactor, vec3(0), clamp(surface.metallic - surface.roughness, 0, 1)), 1);
@@ -289,17 +287,19 @@ void ApplyDefaultLighting() {
 				do {
 					traceRayEXT(tlas, gl_RayFlagsCullBackFacingTrianglesEXT|gl_RayFlagsOpaqueEXT, RAYTRACE_MASK_TERRAIN|RAYTRACE_MASK_ENTITY|RAYTRACE_MASK_CLUTTER|RAYTRACE_MASK_ATMOSPHERE|RAYTRACE_MASK_HYDROSPHERE|RAYTRACE_MASK_PLASMA, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, 0, reflectDirection, xenonRendererData.config.zFar, 0);
 					ray.color.rgb *= transparency;
+					ray.plasma.rgb *= transparency;
 					rayOrigin += reflectDirection * ray.hitDistance - ray.normal * max(2.0, ray.hitDistance) * EPSILON;
 					transparency *= 1.0 - clamp(ray.color.a, 0, 1);
 				} while (transparency > 0.1 && ray.hitDistance > 0);
 			RAY_RECURSION_POP
-			originalRay.color.rgb += ray.color.rgb * albedo * min(surface.metallic, 0.9) + ray.plasma.rgb;
+			originalRay.color.rgb += ray.color.rgb * albedo * min(surface.metallic, 0.9);
+			originalRay.plasma.rgb += ray.plasma.rgb * albedo * min(surface.metallic, 0.9);
 			ray = originalRay;
 		}
 	}
 	
 	// Ambient lighting
-	else {
+	else if (!rayIsUnderWater) {
 		vec3 ambient = vec3(pow(smoothstep(200/*max ambient distance*/, 0, realDistance), 4)) * renderer.baseAmbientBrightness * 0.1;
 		if ((renderer.options & RENDERER_OPTION_RT_AMBIENT_LIGHTING) != 0) {
 			if (recursions <= 1) {
@@ -341,7 +341,7 @@ void ApplyDefaultLighting() {
 					RAY_GI_PUSH
 					for (int i = 0; i < renderer.ambientAtmosphereSamples; ++i) {
 						traceRayEXT(tlas, gl_RayFlagsOpaqueEXT, RAYTRACE_MASK_ATMOSPHERE, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, originalRay.worldPosition, 1.0, normalize(originalRay.normal + RandomInUnitSphere(fakeGiSeed)), 10000, 0);
-						ambient += pow(ray.color.rgb, vec3(0.5)) / renderer.ambientAtmosphereSamples * ambientFactor * renderer.baseAmbientBrightness;
+						ambient += pow(ray.plasma.rgb, vec3(0.5)) / renderer.ambientAtmosphereSamples * ambientFactor * renderer.baseAmbientBrightness;
 					}
 					RAY_GI_POP
 				RAY_RECURSION_POP
@@ -356,11 +356,5 @@ void ApplyDefaultLighting() {
 	// Emission
 	ray.color.rgb += surface.emission * renderer.globalLightingFactor;
 	if (dot(surface.emission,surface.emission) > 0) ray.ssao = 0;
-	
-	if (rayIsGi) return;
-	
-	// Debug Time
-	if (xenonRendererData.config.debugViewMode == RENDERER_DEBUG_VIEWMODE_RAYHIT_TIME) {
-		if (RAY_RECURSIONS == 0) WRITE_DEBUG_TIME
-	}
 }
+#endif

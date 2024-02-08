@@ -4,6 +4,9 @@
 layout(location = 0) rayPayloadEXT RayPayload ray;
 layout(location = 1) rayPayloadEXT RayPayload glassReflectionRay;
 
+#include "lighting.inc.glsl"
+// GetDirectLighting(ray.worldPosition, gl_WorldRayDirectionEXT, ray.normal, albedo, gl_HitTEXT, surface.metallic, surface.roughness, surface.specular)
+
 vec3 mapToSphere(vec2 uv) {
 	// uv += vec2(RandomFloat(coherentSeed), RandomFloat(coherentSeed)) / 100;
 	float theta = 2.0 * 3.1415926 * uv.x;
@@ -52,6 +55,7 @@ void main() {
 	ray.ssao = 0;
 	vec3 rayOrigin = initialRayPosition;
 	vec3 glassTint = vec3(1);
+	vec3 glassSpecular = vec3(0);
 	float ssao = 1;
 	float transparency = 1.0;
 	bool glassReflection = false;
@@ -89,22 +93,29 @@ void main() {
 		glassTint *= tint;
 		rayOrigin += initialRayDirection * ray.hitDistance;
 		// Reflections on Glass
-		if ((renderer.options & RENDERER_OPTION_GLASS_REFLECTIONS) != 0 && !glassReflection && ray.color.a != 1.0 && ray.hitDistance > 0.0 && ray.hitDistance < 200.0 && dot(ray.normal, initialRayDirection) < 0.0) {
+		if ((renderer.options & RENDERER_OPTION_GLASS_REFLECTIONS) != 0 && !glassReflection && ray.color.a != 1.0 && ray.hitDistance > 0.0 && ray.hitDistance < ATMOSPHERE_RAY_MIN_DISTANCE && dot(ray.normal, initialRayDirection) < 0.0) {
 			glassReflection = true;
-			glassReflectionStrength = Fresnel((renderer.viewMatrix * vec4(ray.worldPosition, 1)).xyz, normalize(WORLD2VIEWNORMAL * ray.normal), 1.15);
+			glassReflectionStrength = Fresnel(normalize((renderer.viewMatrix * vec4(ray.worldPosition, 1)).xyz), normalize(WORLD2VIEWNORMAL * ray.normal), 1.15);
 			glassReflectionOrigin = ray.worldPosition + ray.normal * max(2.0, ray.hitDistance) * EPSILON * 10;
 			glassReflectionDirection = reflect(initialRayDirection, ray.normal);
+		}
+		// Specular/Shadows on Glass
+		if ((renderer.options & RENDERER_OPTION_DIRECT_LIGHTING) != 0 && ray.color.a < 1.0) {
+			RayPayload originalRay = ray;
+			glassSpecular += GetDirectLighting(originalRay.worldPosition, initialRayDirection, originalRay.normal, vec3(0), originalRay.hitDistance, 0, 0, 0.5);
+			ray = originalRay;
 		}
 		// Refraction on Glass
 		if ((renderer.options & RENDERER_OPTION_GLASS_REFRACTION) != 0 && ray.color.a < 1.0) {
 			vec3 originalRayDirection = initialRayDirection;
-			initialRayDirection = refract(initialRayDirection, ray.normal, 1.01);
+			initialRayDirection = refract(initialRayDirection, ray.normal, 1.0/1.1);
+			// Refract(initialRayDirection, ray.normal, 1.1);
 			if (dot(initialRayDirection, initialRayDirection) == 0.0) {
 				initialRayDirection = reflect(originalRayDirection, ray.normal);
 			}
 		}
-	} while (ray.color.a < 1.0 && transparency > 0.1 && ray.hitDistance > 0.0 && ray.hitDistance < 200.0);
-	vec4 color = ray.color + ray.plasma;
+	} while (ray.color.a < 1.0 && transparency > 0.1 && ray.hitDistance > 0.0);
+	vec4 color = ray.color + ray.plasma + vec4(glassSpecular, 0);
 	
 	float hitDistance = ray.hitDistance;
 	if (hitDistance < 0) {
@@ -118,7 +129,7 @@ void main() {
 		glassReflectionRay.hitDistance = -1;
 		glassReflectionRay.t2 = 0;
 		traceRayEXT(tlas, gl_RayFlagsCullBackFacingTrianglesEXT|gl_RayFlagsOpaqueEXT, RAYTRACE_MASK_TERRAIN|RAYTRACE_MASK_ENTITY|RAYTRACE_MASK_CLUTTER|RAYTRACE_MASK_ATMOSPHERE|RAYTRACE_MASK_HYDROSPHERE|RAYTRACE_MASK_PLASMA, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, glassReflectionOrigin, 0, glassReflectionDirection, xenonRendererData.config.zFar, 1);
-		color.rgb = mix(color.rgb, glassReflectionRay.color.rgb, glassReflectionStrength);
+		color.rgb = mix(color.rgb, glassReflectionRay.color.rgb, glassReflectionStrength * glassReflectionRay.color.a);
 		color.rgb += glassReflectionRay.plasma.rgb * glassReflectionStrength;
 	}
 	
@@ -247,7 +258,7 @@ void main() {
 			// Fallthrough
 		case RENDERER_DEBUG_VIEWMODE_RAYHIT_TIME:
 		case RENDERER_DEBUG_VIEWMODE_RAYINT_TIME:
-			imageStore(img_normal_or_debug, COORDS, vec4(HeatmapClamped(float(imageLoad(img_normal_or_debug, COORDS).a / (1000000 * xenonRendererData.config.debugViewScale))), 1));
+			imageStore(img_normal_or_debug, COORDS, vec4(HeatmapClamped(float(imageLoad(img_normal_or_debug, COORDS).a / (10000000 * xenonRendererData.config.debugViewScale))), 1));
 			break;
 		case RENDERER_DEBUG_VIEWMODE_MOTION:
 			imageStore(img_normal_or_debug, COORDS, vec4(abs(motion * 1000 * xenonRendererData.config.debugViewScale), 1));

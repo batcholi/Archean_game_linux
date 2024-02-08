@@ -53,4 +53,9 @@ void main() {
 	if (RAY_RECURSIONS == 0) {
 		imageStore(img_primary_albedo_roughness, COORDS, vec4(surface.color.rgb, surface.roughness));
 	}
+	
+	// Debug Time
+	if (xenonRendererData.config.debugViewMode == RENDERER_DEBUG_VIEWMODE_RAYHIT_TIME) {
+		if (RAY_RECURSIONS == 0) WRITE_DEBUG_TIME
+	}
 }
