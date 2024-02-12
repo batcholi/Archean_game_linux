@@ -76,7 +76,7 @@ void main() {
 	ray.t2 = 0;
 	ray.normal = vec3(0);
 	ray.color = vec4(0);
-	ray.ssao = 0;
+	ray.ior = 1;
 	vec3 rayOrigin = initialRayPosition;
 	vec3 glassTint = vec3(1);
 	vec3 glassSpecular = vec3(0);
@@ -88,26 +88,27 @@ void main() {
 	float glassReflectionStrength;
 	vec4 color = vec4(0);
 	ray.emission = vec3(0);
-	uint primaryRayMask = RAYTRACE_MASK_TERRAIN|RAYTRACE_MASK_ENTITY|RAYTRACE_MASK_ATMOSPHERE|RAYTRACE_MASK_HYDROSPHERE|RAYTRACE_MASK_CLUTTER|RAYTRACE_MASK_PLASMA;
-	if (xenonRendererData.config.debugViewMode == RENDERER_DEBUG_VIEWMODE_GI_LIGHTS) {
-		primaryRayMask |= RAYTRACE_MASK_LIGHT;
-	}
+	uint primaryRayMask = RAYTRACE_MASK_SOLID|RAYTRACE_MASK_ATMOSPHERE|RAYTRACE_MASK_HYDROSPHERE|RAYTRACE_MASK_PLASMA;
+	// if (xenonRendererData.config.debugViewMode == RENDERER_DEBUG_VIEWMODE_GI_LIGHTS) {
+	// 	primaryRayMask |= RAYTRACE_MASK_LIGHT;
+	// }
 	do {
-		traceRayEXT(tlas, /*gl_RayFlagsCullBackFacingTrianglesEXT|*/gl_RayFlagsOpaqueEXT/*flags*/, primaryRayMask, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, renderer.cameraZNear, rayDirection, xenonRendererData.config.zFar, 0/*payloadIndex*/);
+		traceRayEXT(tlas, gl_RayFlagsOpaqueEXT/*flags*/, primaryRayMask, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, renderer.cameraZNear, rayDirection, xenonRendererData.config.zFar, 0/*payloadIndex*/);
 		float rDotN = dot(rayDirection, ray.normal);
 		if (rDotN > 0 && ray.color.a < 1.0) {
 			RayPayload originalRay = ray;
-			traceRayEXT(tlas, gl_RayFlagsCullBackFacingTrianglesEXT|gl_RayFlagsOpaqueEXT/*flags*/, primaryRayMask, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, originalRay.hitDistance * 0.999, rayDirection, originalRay.hitDistance * 1.001, 0/*payloadIndex*/);
+			float epsilon = clamp(EPSILON * ray.hitDistance, EPSILON, 0.1);
+			traceRayEXT(tlas, gl_RayFlagsCullBackFacingTrianglesEXT|gl_RayFlagsOpaqueEXT/*flags*/, RAYTRACE_MASK_SOLID, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, originalRay.hitDistance - epsilon, rayDirection, originalRay.hitDistance + epsilon, 0/*payloadIndex*/);
 			if (ray.hitDistance == -1) {
 				ray = originalRay;
 			}
 		}
 		ray.color.rgb *= clamp(transparency, 0.0, 1.0) * glassTint;
 		ray.emission.rgb *= clamp(transparency, 0.0, 1.0) * glassTint;
-		ssao *= ray.ssao;
 		if (ray.hitDistance == -1) {
 			break;
 		}
+		if (dot(ray.emission,ray.emission) > 0) ssao = 0;
 		ssao *= ray.color.a;
 		if (xenonRendererData.config.debugViewMode == RENDERER_DEBUG_VIEWMODE_NORMALS) {
 			break;
@@ -132,7 +133,7 @@ void main() {
 		// Refraction on Glass
 		if ((renderer.options & RENDERER_OPTION_GLASS_REFRACTION) != 0 && ray.color.a < 1.0) {
 			vec3 originalRayDirection = rayDirection;
-			float ior = 1.5;
+			float ior = ray.ior;
 			if (rDotN < 0) {
 				ior = 1.0 / ior;
 			} else {
@@ -160,21 +161,19 @@ void main() {
 		glassReflectionRay.hitDistance = -1;
 		glassReflectionRay.t2 = 0;
 		WriteMotionVectorsAndDepth(glassReflectionOrigin, distance(initialRayPosition, glassReflectionOrigin), false);
-		traceRayEXT(tlas, gl_RayFlagsCullBackFacingTrianglesEXT|gl_RayFlagsOpaqueEXT, RAYTRACE_MASK_TERRAIN|RAYTRACE_MASK_ENTITY|RAYTRACE_MASK_CLUTTER|RAYTRACE_MASK_ATMOSPHERE|RAYTRACE_MASK_HYDROSPHERE|RAYTRACE_MASK_PLASMA, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, glassReflectionOrigin, 0, glassReflectionDirection, xenonRendererData.config.zFar, 1);
+		traceRayEXT(tlas, gl_RayFlagsOpaqueEXT, RAYTRACE_MASK_SOLID|RAYTRACE_MASK_ATMOSPHERE|RAYTRACE_MASK_HYDROSPHERE|RAYTRACE_MASK_PLASMA, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, glassReflectionOrigin, 0, glassReflectionDirection, xenonRendererData.config.zFar, 1);
 		color.rgb = mix(color.rgb, glassReflectionRay.color.rgb, glassReflectionStrength * step(1.0, glassReflectionRay.color.a));
 		color.rgb += glassReflectionRay.emission.rgb * glassReflectionStrength;
 	}
 	
 	color.rgb *= pow(renderer.globalLightingFactor, 4);
-	color.a = mix(1, color.a, renderer.globalLightingFactor);
-	
-	if (RAY_IS_UNDERWATER || color.a > 1) {
-		color.a = 1;
-	}
+	color.a = clamp(mix(1, color.a, renderer.globalLightingFactor), 0, 1);
 	
 	bool hitSomething = ray.hitDistance >= 0 && ray.renderableIndex != -1;
 	
 	if (RAY_IS_UNDERWATER) {
+		color.a = 1;
+		ssao = 0;
 		// Negative distance means underwater
 		imageStore(img_motion, COORDS, vec4(0,0,0,-1));
 	} else {
@@ -201,7 +200,7 @@ void main() {
 			ray.hitDistance = -1;
 			uint rayMask = RAYTRACE_MASK_TERRAIN | RAYTRACE_MASK_ENTITY | RAYTRACE_MASK_HYDROSPHERE | (hitPlasma?0:RAYTRACE_MASK_PLASMA);
 			RAY_SHADOW_PUSH
-				traceRayEXT(tlas, gl_RayFlagsCullBackFacingTrianglesEXT|gl_RayFlagsOpaqueEXT/*flags*/, rayMask/*rayMask*/, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, 0.0, rayDir, 1000, 0/*payloadIndex*/);
+				traceRayEXT(tlas, gl_RayFlagsOpaqueEXT/*flags*/, rayMask/*rayMask*/, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, 0.0, rayDir, 1000, 0/*payloadIndex*/);
 			RAY_SHADOW_POP
 			if (ray.hitDistance == -1 || ray.renderableIndex == -1) {
 				ray.hitDistance = 1000;
