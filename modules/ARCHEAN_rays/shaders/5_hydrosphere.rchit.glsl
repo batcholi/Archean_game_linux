@@ -143,7 +143,6 @@ void main() {
 			RAY_RECURSION_POP
 			if (ray.hitDistance > 0) {
 				originalRay.color.rgb *= ray.color.rgb;
-				originalRay.color.a = min(1, originalRay.color.a + ray.color.a);
 				if (ray.color.a > 0.5) {
 					originalRay.t2 = min(ray.hitDistance * 0.99, originalRay.t2);
 				}
@@ -220,6 +219,7 @@ void main() {
 			}
 		}
 		reflection = ray.color.rgb + ray.emission.rgb;
+		ray.emission.rgb = vec3(0);
 		
 		lighting = GetDirectLighting(hitPoint1, gl_WorldRayDirectionEXT, surfaceNormal, vec3(WATER_OPACITY*WATER_OPACITY), t1, 0, 0, 1) * 0.5;
 		
@@ -255,7 +255,6 @@ void main() {
 		ray.t2 = WATER_MAX_LIGHT_DEPTH;
 		ray.color.rgb = reflection * fresnel * 0.5 + refraction * (1-fresnel) + lighting;
 		ray.color.a = 1;
-		ray.emission.rgb = vec3(0);
 		ray.normal = surfaceNormal;
 		
 		// if (gl_HitTEXT < giantWavesMaxDistance) {
@@ -294,6 +293,7 @@ void main() {
 						ray.color.a = 1;
 						break;
 					}
+					ray.emission.rgb *= colorFilter;
 					colorFilter *= ray.color.rgb;
 					colorFilter *= 1 - ray.color.a;
 					rayPosition += rayDirection * (ray.hitDistance + 0.01);
@@ -364,6 +364,7 @@ void main() {
 						ray.color.a = 1;
 						break;
 					}
+					ray.emission.rgb *= colorFilter;
 					colorFilter *= ray.color.rgb;
 					colorFilter *= 1 - ray.color.a;
 					rayPosition += rayDirection * (ray.hitDistance + 0.01);
@@ -402,7 +403,7 @@ void main() {
 			ray = originalRay;
 		}
 		ray.color.rgb = WATER_TINT * mix(ray.color.rgb, waterLighting, pow(clamp(ray.hitDistance / maxLightDepth, 0, 1), 0.5));
-		ray.emission.rgb *= colorFilter;
+		// ray.emission.rgb *= colorFilter;
 		ray.color.rgb *= colorFilter;
 	}
 	
