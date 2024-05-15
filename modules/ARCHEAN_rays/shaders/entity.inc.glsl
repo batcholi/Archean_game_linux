@@ -34,6 +34,8 @@ void main() {
 		surface.normal *= -1;
 	}
 	
+	vec3 geometricNormal = normalize(MODEL2WORLDNORMAL * surface.normal);
+	
 	// if (OPTION_TEXTURES) {
 		executeCallableEXT(GEOMETRY.material.surfaceIndex, SURFACE_CALLABLE_PAYLOAD);
 	// }
@@ -63,10 +65,10 @@ void main() {
 		if (COORDS == ivec2(gl_LaunchSizeEXT.xy) / 2) {
 			if (surface.renderableData != 0 && renderer.aim.monitorIndex == 0) {
 				renderer.aim.uv = surface.uv1;
-				renderer.aim.monitorIndex = RenderableData(surface.renderableData)[nonuniformEXT(surface.geometryIndex)].monitorIndex;
+				renderer.aim.monitorIndex = RenderableData(surface.renderableData)[surface.geometryIndex].monitorIndex;
 			}
 		}
-		MakeAimable();
+		MakeAimable(geometricNormal);
 	}
 
 	// Write Motion Vectors
