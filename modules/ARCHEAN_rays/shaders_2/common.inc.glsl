@@ -1,43 +1,8 @@
-#ifdef __cplusplus
-	#pragma once
-#endif
+#extension GL_ARB_shader_clock : enable
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_ray_query : require
 
 #include "xenon/renderer/shaders/common.inc.glsl"
-
-#define RENDERABLE_TYPE_TERRAIN_TRI 0
-#define RENDERABLE_TYPE_ENTITY_TRI 1
-#define RENDERABLE_TYPE_ENTITY_BOX 2
-#define RENDERABLE_TYPE_ENTITY_SPHERE 3
-#define RENDERABLE_TYPE_ATMOSPHERE 4
-#define RENDERABLE_TYPE_HYDROSPHERE 5
-#define RENDERABLE_TYPE_ENTITY_VOXEL 6
-#define RENDERABLE_TYPE_CLUTTER_TRI 7
-#define RENDERABLE_TYPE_PLASMA 8
-#define RENDERABLE_TYPE_LIGHT_BOX 9
-#define RENDERABLE_TYPE_CLUTTER_PIPE 10
-#define RENDERABLE_TYPE_CLUTTER_ROCK 11
-#define RENDERABLE_TYPE_PROPELLER 12
-#define RENDERABLE_TYPE_CLUTTER_BOX 13
-#define RENDERABLE_TYPE_CLOUD 14
-#define RENDERABLE_TYPE_HYDROBLOCK 15
-
-#define SURFACE_CALLABLE_PAYLOAD 0
-#define VOXEL_SURFACE_CALLABLE_PAYLOAD 1
-
-#define LIGHT_LUMINOSITY_VISIBLE_THRESHOLD 0.01
-
-// Up to 32 flags
-#define PIPE_FLAG_BOX			(1u << 0)
-#define PIPE_FLAG_CAPSULE		(1u << 1)
-#define PIPE_FLAG_STRIPES		(1u << 2)
-#define PIPE_FLAG_CHROME		(1u << 3)
-#define PIPE_FLAG_GLOSSY		(1u << 5)
-#define PIPE_FLAG_FLEXIBLE		(1u << 6)
-#define PIPE_FLAG_METAL			(1u << 7)
-
-// Up to 16 flags
-#define PLASMA_FLAG_AEROSPIKE	(1u << 0)
-#define PLASMA_FLAG_SHAKE 		(1u << 1)
 
 BUFFER_REFERENCE_STRUCT_READONLY(16) AabbData {
 	aligned_float32_t aabb[6];
@@ -187,6 +152,23 @@ BUFFER_REFERENCE_STRUCT(16) AimBuffer {
 };
 STATIC_ASSERT_ALIGNED16_SIZE(AimBuffer, 96)
 
+BUFFER_REFERENCE_STRUCT_READONLY(16) TLASInstance {
+	aligned_f32mat3x4 transform;
+	aligned_uint32_t instanceCustomIndex_and_mask; // mask>>24, customIndex&0xffffff
+	aligned_uint32_t instanceShaderBindingTableRecordOffset_and_flags; // flags>>24
+	aligned_VkDeviceAddress accelerationStructureReference;
+};
+STATIC_ASSERT_ALIGNED16_SIZE(TLASInstance, 64)
+
+BUFFER_REFERENCE_STRUCT_WRITEONLY(16) MVPBufferCurrent {aligned_f32mat4 mvp;};
+BUFFER_REFERENCE_STRUCT_READONLY(16) MVPBufferHistory {aligned_f32mat4 mvp;};
+BUFFER_REFERENCE_STRUCT_WRITEONLY(8) RealtimeBufferCurrent {aligned_uint64_t mvpFrameIndex;};
+BUFFER_REFERENCE_STRUCT_READONLY(8) RealtimeBufferHistory {aligned_uint64_t mvpFrameIndex;};
+
+BUFFER_REFERENCE_STRUCT_READONLY(8) LightSourceInstanceTable {
+	BUFFER_REFERENCE_ADDR(LightSourceInstanceData) instance;
+};
+
 GLSL_FUNCTION float smoothCurve(float x) {
 	x = clamp(x,0.0f,1.0f);
 	return x*x*x*(x*(x*6.0f-15.0f)+10.0f);
@@ -208,39 +190,171 @@ GLSL_FUNCTION vec4 smoothCurve(vec4 x) {
 	return x*x*x*(x*(x*6.0f-15.0f)+10.0f);
 }
 
-#ifdef GLSL
-	#define EPSILON 0.0001
+struct RendererData {
+	aligned_f32mat4 viewMatrix;
+	aligned_f32mat4 historyViewMatrix;
+	aligned_f32mat4 reprojectionMatrix;
 	
-	struct Surface {
-		vec4 color;
-		vec3 normal;
-		float metallic;
-		vec3 emission;
-		float roughness;
-		vec3 localPosition;
-		float specular;
-		uint64_t renderableData;
-		uint64_t aabbData;
-		uint32_t renderableIndex;
-		uint32_t geometryIndex;
-		uint32_t primitiveIndex;
-		float ior;
-		vec2 uv1;
-		vec2 uv2;
-		vec3 barycentricCoords;
-		float distance;
-		uint64_t geometries;
-		uint64_t geometryInfoData;
-		uint64_t geometryUv1Data;
-		uint64_t geometryUv2Data;
-	};
-	#if defined(SHADER_RCHIT)
-		layout(location = SURFACE_CALLABLE_PAYLOAD) callableDataEXT Surface surface;
-	#endif
-	#if defined(SHADER_SURFACE)
-		layout(location = SURFACE_CALLABLE_PAYLOAD) callableDataInEXT Surface surface;
-	#endif
+	BUFFER_REFERENCE_ADDR(MVPBufferCurrent) mvpBuffer;
+	BUFFER_REFERENCE_ADDR(MVPBufferHistory) mvpBufferHistory;
+	BUFFER_REFERENCE_ADDR(RealtimeBufferCurrent) realtimeBuffer;
+	BUFFER_REFERENCE_ADDR(RealtimeBufferHistory) realtimeBufferHistory;
+	BUFFER_REFERENCE_ADDR(RenderableInstanceData) renderableInstances;
+	BUFFER_REFERENCE_ADDR(TLASInstance) tlasInstances;
+	BUFFER_REFERENCE_ADDR(AimBuffer) aim;
+	aligned_uint64_t _unused1;
+	aligned_uint64_t _unused2;
+	aligned_uint64_t _unused3;
+	BUFFER_REFERENCE_ADDR(LightSourceInstanceTable) lightSources;
+	BUFFER_REFERENCE_ADDR(EnvironmentAudioData) environmentAudio;
 	
+	aligned_f32vec3 wireframeColor;
+	aligned_float32_t wireframeThickness;
+	
+	aligned_i32vec3 worldOrigin;
+	aligned_float32_t cameraZNear;
+	
+	aligned_float64_t timestamp;
+	aligned_uint32_t rays_max_bounces;
+	aligned_float32_t warp;
+	
+	aligned_uint32_t ambientAtmosphereSamples;
+	aligned_uint32_t ambientOcclusionSamples;
+	aligned_float32_t terrain_detail;
+	aligned_float32_t globalLightingFactor;
+	
+	aligned_uint32_t options; // RENDERER_OPTION_*
+	aligned_int32_t atmosphere_raymarch_steps;
+	aligned_float32_t terrain_clutter_detail;
+	aligned_float32_t testSlider;
+	
+	aligned_uint32_t bluenoise_scalar;
+	aligned_uint32_t bluenoise_unitvec1;
+	aligned_uint32_t bluenoise_unitvec2;
+	aligned_uint32_t bluenoise_unitvec3;
+	aligned_uint32_t bluenoise_unitvec3_cosine;
+	aligned_uint32_t bluenoise_vec1;
+	aligned_uint32_t bluenoise_vec2;
+	aligned_uint32_t bluenoise_vec3;
+};
+
+#define SET1_BINDING_TLAS 0
+#define SET1_BINDING_LIGHTS_TLAS 1
+#define SET1_BINDING_RENDERER_DATA 2
+#define SET1_BINDING_RT_PAYLOAD_IMAGE 3
+#define SET1_BINDING_PRIMARY_ALBEDO_ROUGHNESS_IMAGE 4
+#define SET1_BINDING_POST_HISTORY_IMAGE 5
+#define SET1_BINDING_BLOOM_IMAGE 6
+#define SET1_BINDING_CLOUD_IMAGE 7
+#define SET1_BINDING_CLOUD_SAMPLER 8
+
+#define RAYTRACE_MASK_TERRAIN 1u
+#define RAYTRACE_MASK_ENTITY 2u
+#define RAYTRACE_MASK_ATMOSPHERE 4u
+#define RAYTRACE_MASK_HYDROSPHERE 8u
+#define RAYTRACE_MASK_PLASMA 16u
+#define RAYTRACE_MASK_SIMPLE_CLUTTER 32u
+#define RAYTRACE_MASK_COMPLEX_CLUTTER 64u
+#define RAYTRACE_MASK_CLUTTER (RAYTRACE_MASK_SIMPLE_CLUTTER|RAYTRACE_MASK_COMPLEX_CLUTTER)
+#define RAYTRACE_MASK_SOLID (RAYTRACE_MASK_TERRAIN|RAYTRACE_MASK_ENTITY|RAYTRACE_MASK_SIMPLE_CLUTTER|RAYTRACE_MASK_COMPLEX_CLUTTER)
+
+#define COORDS ivec2(gl_LaunchIDEXT.xy)
+#define WORLD2VIEWNORMAL transpose(inverse(mat3(renderer.viewMatrix)))
+#define VIEW2WORLDNORMAL transpose(mat3(renderer.viewMatrix))
+
+layout(set = 1, binding = SET1_BINDING_TLAS) uniform accelerationStructureEXT tlas;
+layout(set = 1, binding = SET1_BINDING_LIGHTS_TLAS) uniform accelerationStructureEXT tlas_lights;
+layout(set = 1, binding = SET1_BINDING_RENDERER_DATA) uniform RendererDataBuffer { RendererData renderer; };
+
+layout(set = 1, binding = 9, rgba32f) uniform image2D images[];
+
+layout(push_constant) uniform RayTracingPushConstant {
+	mat4 viewMatrix;
+	float aspectRatio;
+	float fov;
+	float zNear;
+	float zFar;
+	vec2 jitter;
+	uint32_t albedoOpacityImageIndex;
+	uint32_t normalDistanceImageIndex;
+	uint32_t emissionIorImageIndex;
+	uint32_t extraImageIndex; // roughness, metallic, specular, 8 flags
+};
+
+struct RayPayload {
+	vec3 color;
+	float hitDistance;
+	vec3 normal;
+	int32_t renderableIndex;
+	vec3 localPosition;
+	uint8_t roughness;
+	uint8_t ior;
+	uint8_t surfaceFlags;
+	uint8_t rayFlags;
+};
+
+struct RayShadowPayload {
+	vec3 colorAttenuation;
+	float hitDistance;
+	vec3 emission;
+	uint32_t _unused;
+};
+
+#define RAY_SURFACE_DIFFUSE uint8_t(0x0)
+#define RAY_SURFACE_METALLIC uint8_t(0x1)
+#define RAY_SURFACE_EMISSIVE uint8_t(0x2)
+#define RAY_SURFACE_TRANSPARENT uint8_t(0x4)
+//... 5 more
+
+#define RAY_FLAG_RECURSION uint8_t(0x1)
+#define RAY_FLAG_AIM uint8_t(0x2)
+//... 6 more
+
+#define MODELVIEW (renderer.viewMatrix * mat4(gl_ObjectToWorldEXT))
+#define MODEL2WORLDNORMAL inverse(transpose(mat3(gl_ObjectToWorldEXT)))
+#define MVP (xenonRendererData.config.projectionMatrix * MODELVIEW)
+#define MVP_AA (xenonRendererData.config.projectionMatrixWithTAA * MODELVIEW)
+#define MVP_HISTORY (xenonRendererData.config.projectionMatrix * MODELVIEW_HISTORY)
+#ifdef SHADER_COMP_RAYS
+	#define INSTANCE(q,commited) renderer.renderableInstances[rayQueryGetIntersectionInstanceIdEXT(q,commited)]
+	#define GEOMETRY(q,commited) INSTANCE(q,commited).geometries[rayQueryGetIntersectionGeometryIndexEXT(q,commited)]
+	#define AABB(q,commited) GEOMETRY(q,commited).aabbs[rayQueryGetIntersectionPrimitiveIndexEXT(q,commited)]
+	#define AABB_MIN(q,commited) vec3(AABB(q,commited).aabb[0], AABB(q,commited).aabb[1], AABB(q,commited).aabb[2])
+	#define AABB_MAX(q,commited) vec3(AABB(q,commited).aabb[3], AABB(q,commited).aabb[4], AABB(q,commited).aabb[5])
+	#define AABB_CENTER(q,commited) ((AABB_MIN(q,commited) + AABB_MAX(q,commited)) * 0.5)
+	#define AABB_CENTER_INT(q,commited) ivec3(round(AABB_CENTER(q,commited)))
+	#define COMPUTE_BOX_INTERSECTION(q,commited) \
+		vec3 _rayOrigin = rayQueryGetIntersectionObjectRayOriginEXT(q,commited);\
+		vec3 _rayDirection = rayQueryGetIntersectionObjectRayDirectionEXT(q,commited);\
+		const vec3 _tbot = (AABB_MIN(q,commited) - _rayOrigin) / _rayDirection;\
+		const vec3 _ttop = (AABB_MAX(q,commited) - _rayOrigin) / _rayDirection;\
+		const vec3 _tmin = min(_ttop, _tbot);\
+		const vec3 _tmax = max(_ttop, _tbot);\
+		const float T1 = max(_tmin.x, max(_tmin.y, _tmin.z));\
+		const float T2 = min(_tmax.x, min(_tmax.y, _tmax.z));
+	#define RAY_STARTS_OUTSIDE_T1_T2(q) (rayQueryGetRayTMinEXT(q) <= T1 && T2 > T1)
+	#define RAY_STARTS_BETWEEN_T1_T2(q) (T1 <= rayQueryGetRayTMinEXT(q) && T2 >= rayQueryGetRayTMinEXT(q))
+#else
+	#define INSTANCE renderer.renderableInstances[gl_InstanceID]
+	#define GEOMETRY INSTANCE.geometries[gl_GeometryIndexEXT]
+	#define AABB GEOMETRY.aabbs[gl_PrimitiveID]
+	#define AABB_MIN vec3(AABB.aabb[0], AABB.aabb[1], AABB.aabb[2])
+	#define AABB_MAX vec3(AABB.aabb[3], AABB.aabb[4], AABB.aabb[5])
+	#define AABB_CENTER ((AABB_MIN + AABB_MAX) * 0.5)
+	#define AABB_CENTER_INT ivec3(round(AABB_CENTER))
+	#define COMPUTE_BOX_INTERSECTION \
+		const vec3 _tbot = (AABB_MIN - gl_ObjectRayOriginEXT) / gl_ObjectRayDirectionEXT;\
+		const vec3 _ttop = (AABB_MAX - gl_ObjectRayOriginEXT) / gl_ObjectRayDirectionEXT;\
+		const vec3 _tmin = min(_ttop, _tbot);\
+		const vec3 _tmax = max(_ttop, _tbot);\
+		const float T1 = max(_tmin.x, max(_tmin.y, _tmin.z));\
+		const float T2 = min(_tmax.x, min(_tmax.y, _tmax.z));
+	#define RAY_STARTS_OUTSIDE_T1_T2 (gl_RayTminEXT <= T1 && T1 < gl_RayTmaxEXT && T2 > T1)
+	#define RAY_STARTS_BETWEEN_T1_T2 (T1 <= gl_RayTminEXT && T2 >= gl_RayTminEXT)
+#endif
+
+#if defined(SHADER_RCHIT) || defined(SHADER_RAHIT)
+
 	layout(buffer_reference, std430, buffer_reference_align = 2) buffer readonly IndexBuffer16 {uint16_t indices[];};
 	layout(buffer_reference, std430, buffer_reference_align = 4) buffer readonly IndexBuffer32 {uint32_t indices[];};
 	layout(buffer_reference, std430, buffer_reference_align = 4) buffer readonly VertexBuffer {float vertices[];};
@@ -408,32 +522,62 @@ GLSL_FUNCTION vec4 smoothCurve(vec4 x) {
 		}
 	}
 	
+	vec3 ComputeSurfaceNormal(in vec3 barycentricCoordsOrLocalPosition) {
+		return ComputeSurfaceNormal(uint64_t(INSTANCE.geometries), gl_GeometryIndexEXT, gl_PrimitiveID, barycentricCoordsOrLocalPosition);
+	}
+	vec4 ComputeSurfaceColor(in vec3 barycentricCoordsOrLocalPosition) {
+		return ComputeSurfaceColor(uint64_t(INSTANCE.geometries), gl_GeometryIndexEXT, gl_PrimitiveID, barycentricCoordsOrLocalPosition);
+	}
+	vec2 ComputeSurfaceUV1(in vec3 barycentricCoordsOrLocalPosition) {
+		return ComputeSurfaceUV1(uint64_t(INSTANCE.geometries), gl_GeometryIndexEXT, gl_PrimitiveID, barycentricCoordsOrLocalPosition);
+	}
+	vec2 ComputeSurfaceUV2(in vec3 barycentricCoordsOrLocalPosition) {
+		return ComputeSurfaceUV2(uint64_t(INSTANCE.geometries), gl_GeometryIndexEXT, gl_PrimitiveID, barycentricCoordsOrLocalPosition);
+	}
+	
 #endif
 
-#ifdef __cplusplus
-namespace {
+#if defined(SHADER_RCHIT)
+
+	layout(location = 0) rayPayloadInEXT RayPayload ray;
+	
+	void RayHit(in vec3 color, in vec3 normal, in float hitDistance, in float roughness, in float ior, uint8_t surfaceFlags) {
+		ray.color = color;
+		ray.hitDistance = hitDistance;
+		ray.normal = normalize(MODEL2WORLDNORMAL * normal);
+		ray.renderableIndex = gl_InstanceID;
+		ray.localPosition = gl_ObjectRayOriginEXT + gl_ObjectRayDirectionEXT * hitDistance;
+		ray.roughness = uint8_t(roughness * 255);
+		ray.ior = uint8_t(clamp(ior, 0, 5) * 51);
+		ray.surfaceFlags = surfaceFlags;
+	}
+	
 #endif
 
-float STEFAN_BOLTZMANN_CONSTANT = 5.670374419184429E-8f;
-float GetSunRadiationAtDistanceSqr(float temperature, float radius, float distanceSqr) {
-	return radius*radius * STEFAN_BOLTZMANN_CONSTANT * pow(temperature, 4.0f) / distanceSqr;
-}
-float GetRadiationAtTemperatureForWavelength(float temperature_kelvin, float wavelength_nm) {
-	float hcltkb = 14387769.6f / (wavelength_nm * temperature_kelvin);
-	float w = wavelength_nm / 1000.0f;
-	return 119104.2868f / (w * w * w * w * w * (exp(hcltkb) - 1.0f));
-}
-vec3 GetEmissionColor(float temperatureKelvin) {
-	return vec3(
-		GetRadiationAtTemperatureForWavelength(temperatureKelvin, 680.0f),
-		GetRadiationAtTemperatureForWavelength(temperatureKelvin, 550.0f),
-		GetRadiationAtTemperatureForWavelength(temperatureKelvin, 440.0f)
-	);
-}
-vec3 GetEmissionColor(vec4 emission_temperature) {
-	return vec3(emission_temperature.r, emission_temperature.g, emission_temperature.b) + GetEmissionColor(emission_temperature.a);
-}
+#if defined(SHADER_RAHIT)
+	
+	layout(location = 0) rayPayloadInEXT RayShadowPayload ray;
+	
+	void RayTransparent(in vec3 transparency) {
+		ray.colorAttenuation *= transparency;
+		if (ray.colorAttenuation.r < 0.01 && ray.colorAttenuation.g < 0.01 && ray.colorAttenuation.b < 0.01) {
+			terminateRayEXT;
+		} else {
+			ignoreIntersectionEXT;
+		}
+	}
+	
+	void RayOpaque() {
+		ray.colorAttenuation = vec3(0);
+		terminateRayEXT;
+	}
+	
+#endif
 
-#ifdef __cplusplus
-}
+#ifdef SHADER_RMISS
+	layout(location = 0) rayPayloadInEXT RayPayload ray;
+	
+	void RayNoHit() {
+		ray.renderableIndex = -1;
+	}
 #endif

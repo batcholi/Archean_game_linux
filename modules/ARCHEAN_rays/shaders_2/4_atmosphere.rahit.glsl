@@ -1,13 +1,39 @@
-#define SHADER_RCHIT
+#define SHADER_RAHIT
 #include "common.inc.glsl"
-#include "lighting.inc.glsl"
 
 // https://www.alanzucconi.com/2017/10/10/atmospheric-scattering-1/
+
+#define LIGHT_LUMINOSITY_VISIBLE_THRESHOLD 0.01
 
 const int RAYMARCH_LIGHT_STEPS = 5; // low=2, medium=3, high=5, ultra=8
 const float sunLuminosityThreshold = LIGHT_LUMINOSITY_VISIBLE_THRESHOLD;
 
-// #define SUN_SHAFTS
+uint64_t startTime = clockARB();
+uint stableSeed = InitRandomSeed(gl_LaunchIDEXT.x, gl_LaunchIDEXT.y);
+uint coherentSeed = InitRandomSeed(uint(xenonRendererData.frameIndex),0);
+uint temporalSeed = uint(int64_t(renderer.timestamp * 1000) % 1000000);
+uint seed = InitRandomSeed(stableSeed, coherentSeed);
+
+float STEFAN_BOLTZMANN_CONSTANT = 5.670374419184429E-8f;
+float GetSunRadiationAtDistanceSqr(float temperature, float radius, float distanceSqr) {
+	return radius*radius * STEFAN_BOLTZMANN_CONSTANT * pow(temperature, 4.0f) / distanceSqr;
+}
+
+float GetRadiationAtTemperatureForWavelength(float temperature_kelvin, float wavelength_nm) {
+	float hcltkb = 14387769.6f / (wavelength_nm * temperature_kelvin);
+	float w = wavelength_nm / 1000.0f;
+	return 119104.2868f / (w * w * w * w * w * (exp(hcltkb) - 1.0f));
+}
+vec3 GetEmissionColor(float temperatureKelvin) {
+	return vec3(
+		GetRadiationAtTemperatureForWavelength(temperatureKelvin, 680.0f),
+		GetRadiationAtTemperatureForWavelength(temperatureKelvin, 550.0f),
+		GetRadiationAtTemperatureForWavelength(temperatureKelvin, 440.0f)
+	);
+}
+vec3 GetEmissionColor(vec4 emission_temperature) {
+	return vec3(emission_temperature.r, emission_temperature.g, emission_temperature.b) + GetEmissionColor(emission_temperature.a);
+}
 
 bool RaySphereIntersection(in vec3 position, in vec3 rayDir, in float radius, out float t1, out float t2) {
 	const vec3 p = -position; // equivalent to cameraPosition - spherePosition (or negative position of sphere in view space)
@@ -29,19 +55,7 @@ hitAttributeEXT hit {
 };
 
 void main() {
-	if (RAY_IS_SHADOW) {
-		ray.hitDistance = gl_HitTEXT;
-		ray.color = vec4(0,0,0,1);
-		return;
-	}
-	
-	bool rayIsGi = RAY_IS_GI;
-	bool rayIsUnderwater = RAY_IS_UNDERWATER;
-	uint recursions = RAY_RECURSIONS;
-	
 	int raymarchSteps = renderer.atmosphere_raymarch_steps;
-	
-	ray.hitDistance = -1;
 	
 	AtmosphereData atmosphere = AtmosphereData(AABB.data);
 	vec4 rayleigh = atmosphere.rayleigh;
@@ -66,23 +80,7 @@ void main() {
 		t2 = mix(inner_t1, t2, clamp((innerRadius - startAltitude) / thickness, 0,1));
 	}
 	
-	float nextHitDistance = xenonRendererData.config.zFar;
-	if (recursions < RAY_MAX_RECURSION && !rayIsGi) {
-		RAY_RECURSION_PUSH
-			float alpha = ray.color.a;
-			// Trace Plasma
-			traceRayEXT(tlas, gl_RayFlagsNoOpaqueEXT, RAYTRACE_MASK_PLASMA, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, origin, t1, viewDir, t2, 0);
-			// Trace Opaque
-			traceRayEXT(tlas, gl_RayFlagsOpaqueEXT, RAYTRACE_MASK_SOLID|RAYTRACE_MASK_HYDROSPHERE, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, origin, t1, viewDir, t2, 0);
-			if (ray.hitDistance == -1 && !hitInnerRadius) {
-				traceRayEXT(tlas, gl_RayFlagsOpaqueEXT, RAYTRACE_MASK_SOLID|RAYTRACE_MASK_ATMOSPHERE|RAYTRACE_MASK_HYDROSPHERE, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, origin, t2 * 1.0001, viewDir, xenonRendererData.config.zFar, 0);
-			}
-			if (ray.hitDistance != -1) {
-				nextHitDistance = ray.hitDistance;
-			}
-			ray.color.a = max(ray.color.a, alpha);
-		RAY_RECURSION_POP
-	}
+	float nextHitDistance = ray.hitDistance;
 	
 	const vec2 scaleHeight = vec2(rayleigh.a, mie.a);
 	
@@ -98,9 +96,9 @@ void main() {
 		g = 0.0;
 	}
 	
-	bool shadows = (renderer.options & RENDERER_OPTION_ATMOSPHERIC_SHADOWS) != 0 && !rayIsGi;
+	bool shadows = true;
 	float shadowsMinDistance = 0;
-	if (recursions > 2 || !hasHitSomethingWithinAtmosphere) {
+	if (!hasHitSomethingWithinAtmosphere) {
 		shadowsMinDistance = outerRadius;
 	}
 	
@@ -204,11 +202,7 @@ void main() {
 	else mieScattering = vec3(0);
 	vec4 fog = vec4(rayleighScattering + mieScattering + emission, pow(clamp(maxDepth/thickness, 0, 1), 2));
 	
-	ray.emission.rgb += fog.rgb * renderer.globalLightingFactor;
-	ray.color.a += pow(fog.a, 32);
+	ray.emission += fog.rgb ;// * renderer.globalLightingFactor;
 	
-	// Debug Time
-	if (xenonRendererData.config.debugViewMode == RENDERER_DEBUG_VIEWMODE_RAYHIT_TIME) {
-		if (recursions == 0) WRITE_DEBUG_TIME
-	}
+	RayTransparent(vec3(1-pow(fog.a, 32)));
 }
