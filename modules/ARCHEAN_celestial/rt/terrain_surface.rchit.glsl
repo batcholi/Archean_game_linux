@@ -287,6 +287,9 @@ void main() {
 		}
 	}
 	
+	// Reverse gamma
+	albedo = ReverseGamma(albedo);
+	
 	// Fix black specs caused by skirts
 	if (dot(normal, vec3(0,1,0)) < 0.15) normal = vec3(0,1,0);
 
@@ -296,7 +299,7 @@ void main() {
 			/*normal*/		normal,
 			/*distance*/	gl_HitTEXT,
 			/*roughness*/	1.0,
-			/*ior*/			1.5,
+			/*ior*/			mix(1.01, 2.0, specular),
 			RAY_SURFACE_EMISSIVE
 		);
 	} else {
@@ -305,7 +308,7 @@ void main() {
 			/*normal*/		normal,
 			/*distance*/	gl_HitTEXT,
 			/*roughness*/	1.0,
-			/*ior*/			1.5,
+			/*ior*/			mix(1.01, 2.0, specular),
 			RAY_SURFACE_DIFFUSE
 		);
 	}

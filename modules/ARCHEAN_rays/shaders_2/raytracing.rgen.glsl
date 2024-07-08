@@ -4,11 +4,6 @@
 layout(location = 0) rayPayloadEXT RayPayload ray;
 layout(location = 1) rayPayloadEXT RayShadowPayload shadowRay;
 
-#define NB_LIGHTS 16
-#define SORT_LIGHTS
-#define EPSILON 0.0001
-#define LIGHT_LUMINOSITY_VISIBLE_THRESHOLD 0.01
-
 uint64_t startTime = clockARB();
 uint stableSeed = InitRandomSeed(gl_LaunchIDEXT.x, gl_LaunchIDEXT.y);
 uint coherentSeed = InitRandomSeed(uint(xenonRendererData.frameIndex),0);
@@ -16,9 +11,28 @@ uint temporalSeed = uint(int64_t(renderer.timestamp * 1000) % 1000000);
 uint seed = InitRandomSeed(stableSeed, coherentSeed);
 uint traceRayCount = 0;
 uint nbDirectLights = 0;
+float currentIOR = 1.0;
 
-vec3 GetDirectLighting(in vec3 worldPosition, in vec3 rayDirection, in vec3 normal, in vec3 albedo, in float referenceDistance, in float metallic, in float roughness, in float specular, in float specularHardness) {
-	vec3 position = worldPosition + normal * referenceDistance * 0.001;
+#define NB_LIGHTS 16
+#define SORT_LIGHTS
+#define EPSILON 0.0001
+#define LIGHT_LUMINOSITY_VISIBLE_THRESHOLD 0.01
+
+vec3 MapUVToSphere(vec2 uv) {
+	uv += vec2(RandomFloat(coherentSeed), RandomFloat(coherentSeed)) / 100;
+	float theta = 2.0 * 3.1415926 * uv.x;
+	float phi = acos(2.0 * uv.y - 1.0);
+	theta += RandomFloat(coherentSeed) * 0.01;
+	phi += RandomFloat(coherentSeed) * 0.01;
+	vec3 spherePoint;
+	spherePoint.x = sin(phi) * cos(theta);
+	spherePoint.y = sin(phi) * sin(theta);
+	spherePoint.z = cos(phi);
+	return normalize(spherePoint);
+}
+
+vec3 GetDirectLighting(in vec3 worldPosition, in vec3 rayDirection, in vec3 normal, in vec3 albedo, in float metallic, in float roughness, in float specular, in float specularHardness) {
+	vec3 position = worldPosition + normal * EPSILON * length(worldPosition);
 	vec3 directLighting = vec3(0);
 	
 	rayQueryEXT q;
@@ -40,7 +54,7 @@ vec3 GetDirectLighting(in vec3 worldPosition, in vec3 rayDirection, in vec3 norm
 		vec3 lightDir = normalize(relativeLightPosition);
 		float nDotL = dot(normal, lightDir);
 		LightSourceInstanceData lightSource = renderer.lightSources[lightID].instance;
-		float distanceToLightSurface = length(relativeLightPosition) - abs(lightSource.innerRadius) - referenceDistance * EPSILON;
+		float distanceToLightSurface = length(relativeLightPosition) - abs(lightSource.innerRadius) - EPSILON * length(lightPosition);
 		if (distanceToLightSurface <= 0.001) {
 			if (lightSource.innerRadius > 0) {
 				directLighting += lightSource.color * lightSource.power;
@@ -106,8 +120,10 @@ vec3 GetDirectLighting(in vec3 worldPosition, in vec3 rayDirection, in vec3 norm
 		
 		if (dot(shadowRayDir, normal) > 0) {
 			shadowRay.colorAttenuation = vec3(1);
+			shadowRay.hitDistance = lightsDistance[i] - EPSILON;
+			shadowRay.rayFlags = 0u;
 			++traceRayCount;
-			traceRayEXT(tlas, gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT, RAYTRACE_MASK_SOLID, 0/*rayType*/, 0/*nbRayTypes*/, 1/*missIndex*/, position, 0, shadowRayDir, lightsDistance[i] - EPSILON, 1);
+			traceRayEXT(tlas, gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT, RAYTRACE_MASK_SOLID | RAYTRACE_MASK_LIQUID, 0/*rayType*/, 0/*nbRayTypes*/, 1/*missIndex*/, position, 0, shadowRayDir, shadowRay.hitDistance, 1);
 			vec3 light = lightsColor[i] * lightsPower[i];
 			float NdotL = clamp(dot(normal, shadowRayDir), 0, 1);
 			vec3 diffuse = albedo * NdotL * (1 - metallic) * mix(0.5, 1, roughness);
@@ -125,18 +141,43 @@ void TraceFogRay(in vec3 rayOrigin, in vec3 rayDirection, in float maxDistance, 
 	shadowRay.colorAttenuation = vec3(1);
 	shadowRay.emission = vec3(0);
 	shadowRay.hitDistance = maxDistance;
+	shadowRay.rayFlags = SHADOW_RAY_FLAG_EMISSION;
 	++traceRayCount;
-	traceRayEXT(tlas, gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT/*flags*/, RAYTRACE_MASK_FOG, 0/*rayType*/, 0/*nbRayTypes*/, 1/*missIndex*/, rayOrigin, 0, rayDirection, maxDistance, 1/*payloadIndex*/);
+	traceRayEXT(tlas, gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT/*flags*/, RAYTRACE_MASK_LIQUID, 0/*rayType*/, 0/*nbRayTypes*/, 1/*missIndex*/, rayOrigin, EPSILON * 100, rayDirection, maxDistance, 1/*payloadIndex*/);
+	if (dot(shadowRay.colorAttenuation, shadowRay.colorAttenuation) > 0.001) {
+		traceRayEXT(tlas, gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT/*flags*/, RAYTRACE_MASK_FOG, 0/*rayType*/, 0/*nbRayTypes*/, 1/*missIndex*/, rayOrigin, EPSILON * 100, rayDirection, maxDistance, 1/*payloadIndex*/);
+	}
 	if (dot(shadowRay.emission, shadowRay.emission) > 0) {
 		imageStore(img_composite, COORDS, vec4(shadowRay.emission * colorFilter, 0) + imageLoad(img_composite, COORDS));
 	}
 	colorFilter *= shadowRay.colorAttenuation;
 }
 
-bool TraceGlossyRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 colorFilter) {
-	ray.renderableIndex = -1;
+vec3 TraceAmbientLighting(in vec3 surfaceWorldPosition, in vec3 rayNormal, inout vec3 albedo) {
+	// Ambient lighting
+	uint fakeGiSeed = 598734;
+	shadowRay.colorAttenuation = vec3(1);
+	shadowRay.emission = vec3(0);
+	shadowRay.hitDistance = 100000;
+	shadowRay.rayFlags = SHADOW_RAY_FLAG_EMISSION;
 	++traceRayCount;
-	traceRayEXT(tlas, gl_RayFlagsOpaqueEXT/*flags*/, RAYTRACE_MASK_SOLID, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, 0, rayDirection, xenonRendererData.config.zFar, 0/*payloadIndex*/);
+	vec3 bounceDirection = normalize(rayNormal + 2.0f * vec3(RandomFloat(fakeGiSeed), RandomFloat(fakeGiSeed), RandomFloat(fakeGiSeed)) - 1.0f);
+	traceRayEXT(tlas, gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT/*flags*/, RAYTRACE_MASK_FOG, 0/*rayType*/, 0/*nbRayTypes*/, 1/*missIndex*/, surfaceWorldPosition, 1000, bounceDirection, shadowRay.hitDistance, 1/*payloadIndex*/);
+	vec3 ambient = shadowRay.emission * albedo * 0.1;
+	shadowRay.rayFlags = 0;
+	traceRayEXT(tlas, gl_RayFlagsNoOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT/*flags*/, RAYTRACE_MASK_LIQUID, 0/*rayType*/, 0/*nbRayTypes*/, 1/*missIndex*/, surfaceWorldPosition, 0, bounceDirection, 1, 1/*payloadIndex*/);
+	return ambient * shadowRay.colorAttenuation;
+}
+
+bool TraceGlossyRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 colorFilter) {
+	uint rayMask = RAYTRACE_MASK_SOLID;
+	if ((ray.rayFlags & RAY_FLAG_FLUID) == 0) {
+		rayMask |= RAYTRACE_MASK_LIQUID;
+	}
+	ray.renderableIndex = -1;
+	ray.surfaceFlags = uint8_t(0);
+	++traceRayCount;
+	traceRayEXT(tlas, gl_RayFlagsOpaqueEXT/*flags*/, rayMask, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, 0, rayDirection, xenonRendererData.config.zFar, 0/*payloadIndex*/);
 	if (ray.renderableIndex == -1) {
 		TraceFogRay(rayOrigin, rayDirection, xenonRendererData.config.zFar, colorFilter);
 		return false;
@@ -145,6 +186,7 @@ bool TraceGlossyRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 co
 	// We have hit a solid surface
 	float ior = float(ray.ior) / 51;
 	float roughness = float(ray.roughness) / 255;
+	float metallic = float(ray.surfaceFlags & RAY_SURFACE_METALLIC);
 	vec3 hitWorldPosition = rayOrigin + rayDirection * ray.hitDistance;
 	vec3 hitLocalPosition = ray.localPosition;
 	vec3 reflectionDir = normalize(reflect(rayDirection, ray.normal));
@@ -157,11 +199,14 @@ bool TraceGlossyRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 co
 	
 	// Direct Lighting (shadows with diffuse and specular lighting)
 	if (ray.surfaceFlags == RAY_SURFACE_DIFFUSE) {
-		color += GetDirectLighting(hitWorldPosition, rayDirection, rayNormal, rayColor, rayHitDistance, float(ray.surfaceFlags & RAY_SURFACE_METALLIC), roughness, fresnel * (1-roughness), 8);
+		color += GetDirectLighting(hitWorldPosition, rayDirection, rayNormal, rayColor, float(ray.surfaceFlags & RAY_SURFACE_METALLIC), roughness, fresnel * (1-roughness), 8);
+		color += TraceAmbientLighting(hitWorldPosition, rayNormal, rayColor);
 	}
 	
-	// Write color
+	// Fog
 	TraceFogRay(rayOrigin, rayDirection, rayHitDistance, colorFilter);
+	
+	// Write color
 	color *= colorFilter;
 	imageStore(img_composite, COORDS, vec4(color, 1) + imageLoad(img_composite, COORDS));
 	
@@ -171,77 +216,104 @@ bool TraceGlossyRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 co
 		if (dot(rayDirection, rayDirection) == 0) {
 			rayDirection = reflectionDir;
 		}
-	} else if ((ray.surfaceFlags & RAY_SURFACE_METALLIC) != 0) {
+	} else if (metallic != 0 && roughness == 0) {
 		// Metallic reflections
 		rayDirection = reflectionDir;
 	} else {
 		return false;
 	}
-	colorFilter *= rayColor * 0.8/*bounce attenuation*/;
+	colorFilter *= rayColor * 0.5/*bounce attenuation*/;
 	rayOrigin = hitWorldPosition + rayDirection * EPSILON;
 	return true;
 }
 
 bool TraceSolidRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 colorFilter) {
+	uint rayMask = RAYTRACE_MASK_SOLID;
+	if ((ray.rayFlags & RAY_FLAG_FLUID) == 0) {
+		rayMask |= RAYTRACE_MASK_LIQUID;
+	}
 	ray.renderableIndex = -1;
+	ray.surfaceFlags = uint8_t(0);
 	++traceRayCount;
-	traceRayEXT(tlas, gl_RayFlagsOpaqueEXT/*flags*/, RAYTRACE_MASK_SOLID, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, xenonRendererData.config.zNear, rayDirection, xenonRendererData.config.zFar, 0/*payloadIndex*/);
+	traceRayEXT(tlas, gl_RayFlagsOpaqueEXT/*flags*/, rayMask, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, 0, rayDirection, xenonRendererData.config.zFar, 0/*payloadIndex*/);
 	int hitRenderableIndex = ray.renderableIndex;
 	
 	if (hitRenderableIndex == -1) {
 		// First ray hit nothing
-		if (imageLoad(img_motion, COORDS).w == 0) {
-			imageStore(img_depth, COORDS, vec4(0));
-			imageStore(img_motion, COORDS, vec4(0));
-		}
 		TraceFogRay(rayOrigin, rayDirection, xenonRendererData.config.zFar, colorFilter);
+		return false;
 	} else {
+		// Fix Z fighting with interior faces of glass
+		if (ray.ior == 0) {
+			ray.ior = uint8_t(51);
+			RayPayload originalRay = ray;
+			float epsilon = clamp(EPSILON * originalRay.hitDistance, EPSILON, 0.1);
+			traceRayEXT(tlas, gl_RayFlagsCullBackFacingTrianglesEXT|gl_RayFlagsOpaqueEXT/*flags*/, RAYTRACE_MASK_SOLID, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, originalRay.hitDistance - epsilon, rayDirection, originalRay.hitDistance + epsilon, 0/*payloadIndex*/);
+			if (ray.renderableIndex == -1) {
+				ray = originalRay;
+			} else {
+				hitRenderableIndex = ray.renderableIndex;
+			}
+		}
+		
 		// We have hit a solid surface
 		float ior = float(ray.ior) / 51;
 		float roughness = float(ray.roughness) / 255;
+		float metallic = float(ray.surfaceFlags & RAY_SURFACE_METALLIC);
 		vec3 hitWorldPosition = rayOrigin + rayDirection * ray.hitDistance;
 		vec3 hitLocalPosition = ray.localPosition;
-		vec3 reflectionDir = normalize(reflect(rayDirection, ray.normal));
-		vec3 rayColor = ray.color;
 		vec3 rayNormal = ray.normal;
+		vec3 reflectionDir = normalize(reflect(rayDirection, rayNormal));
+		vec3 refractionDir = refract(rayDirection, rayNormal, currentIOR/ior);
+		vec3 rayColor = ray.color;
 		float ssao = 1;
 		uint8_t raySurfaceFlags = ray.surfaceFlags;
 		float rayHitDistance = ray.hitDistance;
 		
 		// Write Motion Vectors
 		if (imageLoad(img_motion, COORDS).w == 0) {
-			mat4 mvp = xenonRendererData.config.projectionMatrix * renderer.viewMatrix * mat4(transpose(renderer.tlasInstances[hitRenderableIndex].transform));
-			renderer.mvpBuffer[hitRenderableIndex].mvp = mvp;
-			renderer.realtimeBuffer[hitRenderableIndex].mvpFrameIndex = xenonRendererData.frameIndex;
-			vec4 ndc = mvp * vec4(hitLocalPosition, 1);
-			ndc /= ndc.w;
-			mat4 mvpHistory;
-			if (renderer.realtimeBufferHistory[hitRenderableIndex].mvpFrameIndex == xenonRendererData.frameIndex - 1) {
-				mvpHistory = renderer.mvpBufferHistory[hitRenderableIndex].mvp;
-			} else {
-				mvpHistory = renderer.reprojectionMatrix * mvp;
+			if ((raySurfaceFlags & RAY_SURFACE_TRANSPARENT) == 0 || dot(refractionDir, rayDirection) < 0.5) {
+				if ((ray.rayFlags & RAY_FLAG_FLUID) == 0) {
+					mat4 mvp = xenonRendererData.config.projectionMatrix * renderer.viewMatrix * mat4(transpose(renderer.tlasInstances[hitRenderableIndex].transform));
+					renderer.mvpBuffer[hitRenderableIndex].mvp = mvp;
+					renderer.realtimeBuffer[hitRenderableIndex].mvpFrameIndex = xenonRendererData.frameIndex;
+					vec4 ndc = mvp * vec4(hitLocalPosition, 1);
+					ndc /= ndc.w;
+					mat4 mvpHistory;
+					if (renderer.realtimeBufferHistory[hitRenderableIndex].mvpFrameIndex == xenonRendererData.frameIndex - 1) {
+						mvpHistory = renderer.mvpBufferHistory[hitRenderableIndex].mvp;
+					} else {
+						mvpHistory = renderer.reprojectionMatrix * mvp;
+					}
+					vec4 ndc_history = mvpHistory * vec4(hitLocalPosition, 1);
+					ndc_history /= ndc_history.w;
+					vec3 motion = ndc_history.xyz - ndc.xyz;
+					imageStore(img_motion, COORDS, vec4(motion, rayHitDistance));
+					vec4 clipSpace = mat4(xenonRendererData.config.projectionMatrix) * mat4(renderer.viewMatrix) * vec4(hitWorldPosition, 1);
+					float depth = clamp(clipSpace.z / clipSpace.w, 0, 1);
+					imageStore(img_depth, COORDS, vec4(depth));
+				}
 			}
-			vec4 ndc_history = mvpHistory * vec4(hitLocalPosition, 1);
-			ndc_history /= ndc_history.w;
-			vec3 motion = ndc_history.xyz - ndc.xyz;
-			imageStore(img_motion, COORDS, vec4(motion, rayHitDistance));
-			vec4 clipSpace = mat4(xenonRendererData.config.projectionMatrix) * mat4(renderer.viewMatrix) * vec4(hitWorldPosition, 1);
-			float depth = clamp(clipSpace.z / clipSpace.w, 0, 1);
-			imageStore(img_depth, COORDS, vec4(depth));
-			imageStore(img_normal_or_debug, COORDS, vec4(rayNormal, ssao));
 		}
 		
 		vec3 color = rayColor * float(raySurfaceFlags & RAY_SURFACE_EMISSIVE);
 		float fresnel = Fresnel(rayDirection, rayNormal, ior);
 		
 		// Direct Lighting (shadows with diffuse and specular lighting)
-		if (raySurfaceFlags == RAY_SURFACE_DIFFUSE/* || ray.surfaceFlags == RAY_SURFACE_TRANSPARENT*/) {
-			color += GetDirectLighting(hitWorldPosition, rayDirection, rayNormal, rayColor, rayHitDistance, float(raySurfaceFlags & RAY_SURFACE_METALLIC), roughness, fresnel * (1-roughness), 8);
+		if (raySurfaceFlags == 0/*RAY_SURFACE_DIFFUSE*/ || (roughness > 0 && metallic == 1)) {
+			color += GetDirectLighting(hitWorldPosition, rayDirection, rayNormal, rayColor, metallic, roughness, mix(fresnel, 1.0, metallic), mix(mix(256, 32, roughness), 8, metallic));
+			color += TraceAmbientLighting(hitWorldPosition, rayNormal, rayColor);
+		} else if (raySurfaceFlags == RAY_SURFACE_TRANSPARENT && ior > 1) {
+			color += GetDirectLighting(hitWorldPosition, rayDirection, rayNormal, vec3(0), 0, 1, fresnel*fresnel, 16);
 		}
 		
+		// Fog
+		TraceFogRay(rayOrigin, rayDirection, rayHitDistance, colorFilter);
+		ssao *= max(colorFilter.x, max(colorFilter.y, colorFilter.z));
+		
 		// Glossy reflections
-		if (ray.roughness == 0) {
-			vec3 reflectionOrigin = hitWorldPosition + rayNormal * EPSILON;
+		if (roughness == 0 && ior > 1) {
+			vec3 reflectionOrigin = hitWorldPosition + rayNormal * EPSILON * rayHitDistance;
 			vec3 reflectionDirection = reflectionDir;
 			vec3 reflectionColorFilter = fresnel * colorFilter;
 			for (int i = 0; i < 5; i++) {
@@ -249,30 +321,29 @@ bool TraceSolidRay(inout vec3 rayOrigin, inout vec3 rayDirection, inout vec3 col
 			}
 		}
 		
-		// Fog
-		TraceFogRay(rayOrigin, rayDirection, rayHitDistance, colorFilter);
-		
 		// Write color
 		color *= colorFilter;
 		imageStore(img_composite, COORDS, vec4(color, 1) + imageLoad(img_composite, COORDS));
+		imageStore(img_normal_or_debug, COORDS, vec4(rayNormal, ssao));
 		
-		if (float(raySurfaceFlags & RAY_SURFACE_TRANSPARENT) != 0) {
+		if ((raySurfaceFlags & RAY_SURFACE_TRANSPARENT) != 0) {
 			// Refractions
-			rayDirection = refract(rayDirection, rayNormal, 1.0/ior);
+			rayDirection = refractionDir;
 			if (dot(rayDirection, rayDirection) == 0) {
 				rayDirection = reflectionDir;
+			} else {
+				currentIOR = ior;
 			}
-		} else if ((raySurfaceFlags & RAY_SURFACE_METALLIC) != 0) {
+		} else if (metallic != 0 && roughness == 0) {
 			// Metallic reflections
 			rayDirection = reflectionDir;
 		} else {
 			return false;
 		}
-		colorFilter *= rayColor * 0.8/*bounce attenuation*/;
+		colorFilter *= rayColor * 0.9/*bounce attenuation*/;
 		rayOrigin = hitWorldPosition + rayDirection * EPSILON;
+		return true;
 	}
-	
-	return hitRenderableIndex != -1;
 }
 
 void main() {
@@ -287,7 +358,7 @@ void main() {
 	const vec3 viewDir = normalize(vec4(inverse(projMatrix) * vec4(uv*2-1, 1, 1)).xyz);
 	const vec3 initialRayDirection = normalize(VIEW2WORLDNORMAL * viewDir);
 	vec3 rayDirection = initialRayDirection;
-	vec3 rayOrigin = initialRayPosition;
+	vec3 rayOrigin = initialRayPosition ;// + initialRayDirection * xenonRendererData.config.zNear;
 	vec3 colorFilter = vec3(renderer.globalLightingFactor * renderer.globalLightingFactor);
 	
 	ray.renderableIndex = -1;
@@ -300,23 +371,92 @@ void main() {
 		renderer.aim.hitDistance = 1e100;
 	}
 	
+	// Clear images
 	imageStore(img_composite, COORDS, vec4(0));
-	if (xenonRendererData.config.debugViewMode != 0) {
-		imageStore(img_normal_or_debug, COORDS, vec4(0));
-	}
+	imageStore(img_depth, COORDS, vec4(0));
+	imageStore(img_normal_or_debug, COORDS, vec4(0));
 	
+	// Clear motion vectors/depth
+	vec4 ndc = vec4(uv * 2 - 1, 0, 1);
+	vec4 ndc_history = renderer.reprojectionMatrix * ndc;
+	ndc_history /= ndc_history.w;
+	vec3 motion = ndc_history.xyz - ndc.xyz;
+	imageStore(img_depth, COORDS, vec4(0));
+	imageStore(img_motion, COORDS, vec4(motion, 0));
+	
+	// Trace Rays
 	if (xenonRendererData.config.debugViewMode > RENDERER_DEBUG_VIEWMODE_TEST) {
 		ray.renderableIndex = -1;
+		ray.surfaceFlags = uint8_t(0);
 		ray.normal = vec3(0);
-		traceRayEXT(tlas, gl_RayFlagsOpaqueEXT/*flags*/, RAYTRACE_MASK_SOLID, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, xenonRendererData.config.zNear, rayDirection, xenonRendererData.config.zFar, 0/*payloadIndex*/);
+		traceRayEXT(tlas, gl_RayFlagsOpaqueEXT/*flags*/, RAYTRACE_MASK_SOLID|RAYTRACE_MASK_LIQUID, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, xenonRendererData.config.zNear, rayDirection, xenonRendererData.config.zFar, 0/*payloadIndex*/);
 		imageStore(img_normal_or_debug, COORDS, vec4(ray.normal, 1));
 	} else {
-		// Trace Rays
 		for (int i = 0; i < 20; i++) {
 			if (!TraceSolidRay(rayOrigin, rayDirection, colorFilter)) break;
 		}
 	}
 	
+	// Trace environment audio
+	const int MAX_AUDIO_BOUNCE = 1;
+	const uvec2 environment_audio_trace_size = uvec2(200, 200);
+	vec4 testcolor = vec4(0);
+	if (gl_LaunchIDEXT.x < environment_audio_trace_size.x && gl_LaunchIDEXT.y < environment_audio_trace_size.y && xenonRendererData.config.debugViewMode <= RENDERER_DEBUG_VIEWMODE_TEST) {
+		testcolor.a = 1;
+		vec3 rayDir = inverse(mat3(renderer.viewMatrix)) * MapUVToSphere(vec2(gl_LaunchIDEXT) / vec2(environment_audio_trace_size));
+		rayOrigin = initialRayPosition;
+		int envAudioBounce = 0;
+		float audible = 1.0;
+		
+		do {
+			ray.hitDistance = -1;
+			ray.renderableIndex = -1;
+			ray.hitDistance = ENVIRONMENT_AUDIO_MAX_DISTANCE;
+			traceRayEXT(tlas, gl_RayFlagsCullBackFacingTrianglesEXT|gl_RayFlagsOpaqueEXT/*flags*/, RAYTRACE_MASK_TERRAIN | RAYTRACE_MASK_ENTITY | RAYTRACE_MASK_LIQUID/*rayMask*/, 0/*rayType*/, 0/*nbRayTypes*/, 0/*missIndex*/, rayOrigin, 0.0, rayDir, ENVIRONMENT_AUDIO_MAX_DISTANCE, 0/*payloadIndex*/);
+			
+			// Plasma
+			rayQueryEXT rq;
+			rayQueryInitializeEXT(rq, tlas, gl_RayFlagsNoOpaqueEXT, RAYTRACE_MASK_FOG, rayOrigin, 0, rayDir, ray.hitDistance);
+			while (rayQueryProceedEXT(rq)) {
+				int renderableIndex = rayQueryGetIntersectionInstanceIdEXT(rq, false);
+				renderer.environmentAudio.audibleRenderables[renderableIndex].audible = max(renderer.environmentAudio.audibleRenderables[renderableIndex].audible, audible);
+			}
+			
+			if (ray.renderableIndex == -1) {
+				testcolor.rgb = vec3(0);
+				atomicAdd(renderer.environmentAudio.miss, 1);
+				break;
+			} else {
+				uint hitMask = renderer.tlasInstances[ray.renderableIndex].instanceCustomIndex_and_mask >> 24;
+				if (hitMask == RAYTRACE_MASK_TERRAIN) {
+					atomicAdd(renderer.environmentAudio.terrain, 1);
+					testcolor.rgb = mix(testcolor.rgb, vec3(1,0,0), audible);
+					break;
+				}
+				else if (hitMask == RAYTRACE_MASK_ENTITY) {
+					renderer.environmentAudio.audibleRenderables[ray.renderableIndex].audible = max(renderer.environmentAudio.audibleRenderables[ray.renderableIndex].audible, audible);
+					atomicAdd(renderer.environmentAudio.object, 1);
+					testcolor.rgb = mix(testcolor.rgb, vec3(0,1,0), audible);
+					if (envAudioBounce++ == MAX_AUDIO_BOUNCE) {
+						break;
+					}
+					rayOrigin += rayDir * ray.hitDistance + ray.normal * EPSILON;
+					rayDir = reflect(rayDir, ray.normal);
+					audible *= 0.5;
+				}
+				else if (hitMask == RAYTRACE_MASK_LIQUID) {
+					atomicAdd(renderer.environmentAudio.hydrosphere, 1);
+					renderer.environmentAudio.hydrosphereDistance = atomicMin(renderer.environmentAudio.hydrosphereDistance, int(ray.hitDistance * 100));
+					testcolor.rgb = mix(testcolor.rgb, vec3(0,0,1), audible);
+					break;
+				} else {
+					break;
+				}
+			}
+		} while (true);
+	}
+	
+	// Debug Views
 	switch (xenonRendererData.config.debugViewMode) {
 		default:
 		case RENDERER_DEBUG_VIEWMODE_NONE:
@@ -334,11 +474,13 @@ void main() {
 			imageStore(img_normal_or_debug, COORDS, vec4(HeatmapClamped(float(nbDirectLights) / float(NB_LIGHTS)), 1));
 			break;
 		case RENDERER_DEBUG_VIEWMODE_ENVIRONMENT_AUDIO:
+			imageStore(img_normal_or_debug, COORDS, testcolor);
 			break;
 		case RENDERER_DEBUG_VIEWMODE_ALPHA:
 			imageStore(img_normal_or_debug, COORDS, vec4(HeatmapClamped(pow(imageLoad(img_resolved, COORDS).a, xenonRendererData.config.debugViewScale)), 1));
 			break;
 		case RENDERER_DEBUG_VIEWMODE_TEST:
+			// imageStore(img_normal_or_debug, COORDS, testcolor);
 			break;
 		case RENDERER_DEBUG_VIEWMODE_DISTANCE:
 			if (ray.renderableIndex == -1) break;
